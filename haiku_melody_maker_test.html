@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>俳句メロディメーカー（JSON提出版）</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  body{font-family:system-ui, -apple-system, "Hiragino Kaku Gothic ProN","Meiryo",Arial; margin:16px; color:#111}
+  h1{font-size:18px;margin:0 0 8px}
+  textarea{width:100%;height:64px;padding:8px;box-sizing:border-box}
+  .controls{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:8px 0}
+  button,input[type=file]{padding:6px 10px;font-size:14px}
+  .sliders{margin:8px 0}
+  table{border-collapse:collapse;margin-top:10px}
+  th,td{width:48px;height:48px;border:1px solid #444;text-align:center;vertical-align:middle;position:relative;cursor:pointer}
+  td::before{content:attr(data-note);position:absolute;top:2px;left:4px;font-size:12px;color:rgba(0,0,0,0.18);pointer-events:none}
+  td.rest{background:#eee;cursor:default}
+  td.highlight{background:#ffea8a}
+  td .mark{font-size:20px;z-index:2;position:relative}
+  .info{font-size:13px;color:#444;margin-top:8px}
+</style>
+</head>
+<body>
+<h1>俳句メロディメーカー — JSON提出版</h1>
+
+<label class="info">俳句を入力（空白は自動除去）。入力後「俳句をマス目に配置」を押してください。</label>
+<textarea id="haikuInput" placeholder="例：古池や 蛙飛び込む 水の音"></textarea>
+
+<div class="controls">
+  <button id="setBtn">俳句をマス目に配置</button>
+  <button id="playBtn">▶ 再生</button>
+  <button id="stopBtn">■ 停止</button>
+  <button id="saveBtn">💾 作品を保存（JSONダウンロード）</button>
+  <input id="loadFile" type="file" accept=".json">
+  <button id="clearBtn">↺ リセット</button>
+</div>
+
+<div class="sliders">
+  <label>テンポ <span id="tempoVal">120</span> BPM
+    <input id="tempo" type="range" min="60" max="180" value="120" style="width:220px" oninput="tempoVal.textContent=this.value">
+  </label>
+  <br>
+  <label>音量 <span id="volVal">100</span>%
+    <input id="volume" type="range" min="10" max="200" value="100" style="width:220px" oninput="volVal.textContent=this.value">
+  </label>
+</div>
+
+<div id="gridWrap"></div>
+
+<div class="info">操作：列のセルをタップで「○（短音）」が付く／外す。○を付けるとクリック時に即音が鳴ります。5-7-5の区切り後に自動で1拍の休符列が入ります。</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/lz-string/1.4.4/lz-string.min.js"></script>
+<script>
+/* ===== 設定 ===== */
+const NOTES = ["高レ","ド","ラ","ソ","ミ","低レ"]; // 上＝高音、下＝低音
+const FREQS = {"低レ":293.66,"ミ":329.63,"ソ":392.00,"ラ":440.00,"ド":523.25,"高レ":587.33};
+
+let grid = []; // grid[row][col] => td element
+let rows = NOTES.length;
+let cols = 0;
+
+const gridWrap = document.getElementById("gridWrap");
+const haikuInput = document.getElementById("haikuInput");
+const tempoSlider = document.getElementById("tempo");
+const volumeSlider = document.getElementById("volume");
+const tempoVal = document.getElementById("tempoVal");
+const volVal = document.getElementById("volVal");
+
+/* ===== Audio ===== */
+let audioCtx = null;
+let masterGain = null;
+function ensureAudio(){
+  if(!audioCtx){
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    masterGain = audioCtx.createGain();
+    masterGain.connect(audioCtx.destination);
+    masterGain.gain.value = volumeSlider.value/100;
+  }
+}
+function playToneNow(freq, dur=0.38){
+  ensureAudio();
+  const o = audioCtx.createOscillator();
+  const g = audioCtx.createGain();
+  o.type = "sine";
+  o.frequency.value = freq;
+  g.gain.setValueAtTime(0.0001, audioCtx.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.18, audioCtx.currentTime + 0.01);
+  g.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + dur - 0.02);
+  o.connect(g); g.connect(masterGain);
+  o.start(); o.stop(audioCtx.currentTime + dur + 0.05);
+}
+
+/* ===== マス目作成（5-7-5で自動休符列） ===== */
+function setHaiku(){
+  const raw = haikuInput.value.replace(/\s+/g,'');
+  if(!raw){ alert("俳句を入力してください"); return; }
+  const chars = raw.split('');
+  const breaks = [5,12];
+  const withRests = [];
+  for(let i=0;i<chars.length;i++){
+    withRests.push(chars[i]);
+    if(breaks.includes(i+1)) withRests.push("休");
+  }
+  cols = withRests.length;
+
+  // build table: head row = characters
+  gridWrap.innerHTML = '';
+  const table = document.createElement('table');
+  const trHead = document.createElement('tr');
+  trHead.appendChild(document.createElement('th'));
+  for(let c=0;c<cols;c++){
+    const th = document.createElement('th');
+    th.style.width='48px'; th.style.height='32px';
+    if(withRests[c] === '休'){ th.textContent=''; th.style.backgroundColor='#eee'; }
+    else th.textContent = withRests[c];
+    trHead.appendChild(th);
+  }
+  table.appendChild(trHead);
+
+  // rows for notes (high->low)
+  grid = [];
+  for(let r=0;r<rows;r++){
+    const tr = document.createElement('tr');
+    const th = document.createElement('th');
+    th.textContent = NOTES[r];
+    th.style.width='48px'; th.style.height='48px';
+    tr.appendChild(th);
+    grid[r] = [];
+    for(let c=0;c<cols;c++){
+      const td = document.createElement('td');
+      td.setAttribute('data-note', NOTES[r]);
+      td.dataset.state = (withRests[c] === '休') ? '-1' : '0'; // -1 = rest column
+      if(withRests[c] === '休'){ td.classList.add('rest'); td.style.cursor='default'; }
+      else {
+        td.addEventListener('click', ()=>{ toggleCell(td); });
+        td.addEventListener('touchstart', (e)=>{ e.preventDefault(); toggleCell(td); });
+      }
+      const mark = document.createElement('div'); mark.className='mark';
+      td.appendChild(mark);
+      tr.appendChild(td);
+      grid[r][c] = td;
+    }
+    table.appendChild(tr);
+  }
+  gridWrap.appendChild(table);
+}
+
+/* toggle 0<->1 and play on set */
+function toggleCell(td){
+  if(td.dataset.state === '-1') return;
+  td.dataset.state = (td.dataset.state === '0') ? '1' : '0';
+  td.querySelector('.mark').textContent = (td.dataset.state === '1') ? '○' : '';
+  if(td.dataset.state === '1'){
+    const note = td.dataset.note;
+    playToneNow(FREQS[note]);
+  }
+}
+
+/* ===== 再生（列ごと） ===== */
+let isPlaying=false, stopFlag=false;
+function playMelody(){
+  if(isPlaying) return;
+  ensureAudio();
+  // update master gain from slider
+  masterGain.gain.value = volumeSlider.value/100;
+  const bpm = parseInt(tempoSlider.value);
+  const beat = 60 / bpm;
+  isPlaying = true; stopFlag = false;
+  let col = 0;
+  (function step(){
+    if(stopFlag || col >= cols){ isPlaying=false; return; }
+    // check if this column is a rest column (dataset.state === -1)
+    let isRestCol = (grid[0][col].dataset.state === '-1');
+    // play any marked notes in column
+    for(let r=0;r<rows;r++){
+      const td = grid[r][col];
+      if(!td) continue;
+      if(td.dataset.state === '1'){
+        const note = td.dataset.note;
+        playToneNow(FREQS[note], beat*0.95);
+        td.classList.add('highlight');
+      }
+    }
+    setTimeout(()=>{
+      for(let r=0;r<rows;r++){ if(grid[r][col]) grid[r][col].classList.remove('highlight'); }
+      col++; step();
+    }, beat*1000);
+  })();
+}
+function stopMelody(){ stopFlag=true; isPlaying=false; }
+
+/* ===== JSON 保存（ダウンロード） ===== */
+function serialize(){
+  // flatten: haiku string (raw), rows, cols, flat string row-major where -1 = '-' , 0='0', 1='1'
+  const raw = haikuInput.value.replace(/\s+/g,'');
+  let flat = '';
+  for(let r=0;r<rows;r++){
+    for(let c=0;c<cols;c++){
+      const td = grid[r][c];
+      flat += (td.dataset.state === '-1') ? '-' : td.dataset.state; // '-' for rest col
+    }
+  }
+  return { haiku: raw, rows, cols, flat, tempo: parseInt(tempoSlider.value), volume: parseInt(volumeSlider.value) };
+}
+
+function downloadJSON(){
+  try{
+    const obj = serialize();
+    const blob = new Blob([JSON.stringify(obj)], {type:'application/json'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'haiku_melody.json';
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }catch(e){ alert('保存に失敗しました'); console.error(e); }
+}
+
+/* ===== JSON 読み込み（ファイル） ===== */
+function loadJSONFile(file){
+  const reader = new FileReader();
+  reader.onload = (e)=>{
+    try{
+      const obj = JSON.parse(e.target.result);
+      // put haiku and rebuild grid using setHaiku-like flow but using provided object
+      document.getElementById('haikuInput').value = obj.haiku || '';
+      // create with breaks based on length: we need to compute withRests length to match obj.cols
+      // We'll call setHaiku() to build grid from input haiku, then overwrite states from flat
+      setHaiku();
+      // if grid size mismatches, try to accept shorter/longer safely
+      let i = 0;
+      for(let r=0;r<rows;r++){
+        for(let c=0;c<cols;c++){
+          const td = grid[r][c];
+          const ch = (obj.flat && obj.flat[i]!==undefined) ? obj.flat[i] : '0';
+          td.dataset.state = (ch === '-') ? '-1' : ch;
+          td.querySelector('.mark').textContent = (td.dataset.state === '1') ? '○' : '';
+          i++;
+        }
+      }
+      // restore tempo/volume if present
+      if(typeof obj.tempo === 'number') { tempoSlider.value = obj.tempo; tempoVal.textContent = obj.tempo; }
+      if(typeof obj.volume === 'number') { volumeSlider.value = obj.volume; volVal.textContent = obj.volume; }
+      alert('読み込み完了');
+    }catch(err){
+      alert('ファイルの読み込みに失敗しました（形式が不正）');
+      console.error(err);
+    }
+  };
+  reader.readAsText(file);
+}
+
+/* ===== UI イベント割当 ===== */
+document.getElementById('setBtn').addEventListener('click', ()=>{ setHaiku(); });
+document.getElementById('playBtn').addEventListener('click', ()=>{ playMelody(); });
+document.getElementById('stopBtn').addEventListener('click', ()=>{ stopMelody(); });
+document.getElementById('saveBtn').addEventListener('click', ()=>{ downloadJSON(); });
+document.getElementById('loadFile').addEventListener('change', (e)=>{ if(e.target.files[0]) loadJSONFile(e.target.files[0]); e.target.value=''; });
+document.getElementById('clearBtn').addEventListener('click', ()=>{ location.reload(); });
+
+/* Keyboard/mobile friendly: ensure audio context created on first gesture */
+document.addEventListener('click', ()=>{ try{ if(audioCtx && audioCtx.state==='suspended') audioCtx.resume(); }catch(e){} }, {once:true});
+</script>
+</body>
+</html>
